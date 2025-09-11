@@ -57,16 +57,33 @@ class FlashAttention2Function(torch.autograd.Function):
                         
                         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
                         # 1. Apply causal masking if is_causal is True.
+                        if is_causal:
+                            # Create causal mask for the current tile
+                            # We need to consider the absolute positions in the sequence
+                            row_indices = torch.arange(q_start, q_end, device=Q.device).unsqueeze(-1)
+                            col_indices = torch.arange(k_start, k_end, device=Q.device).unsqueeze(0)
+                            # Create mask where row < col (future positions)
+                            causal_mask = row_indices < col_indices
+                            # Apply mask: set future positions to -inf
+                            S_ij = S_ij.masked_fill(causal_mask, -float('inf'))
                         #
                         # 2. Compute the new running maximum
+                        m_ij, _ = torch.max(S_ij, dim=-1)
+                        m_new = torch.maximum(m_i, m_ij)
                         #
                         # 3. Rescale the previous accumulators (o_i, l_i)
+                        o_i = o_i * torch.exp(m_i - m_new).unsqueeze(-1)
+                        l_i = l_i * torch.exp(m_i - m_new)
                         #
                         # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
+                        P_tilde_ij = torch.exp(S_ij - m_new.unsqueeze(-1)).to(Q.dtype)
                         #
                         # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
+                        o_i = o_i + P_tilde_ij @ V_tile
+                        l_i = l_i + torch.sum(P_tilde_ij, dim=-1)
                         #
                         # 6. Update the running max for the next iteration
+                        m_i = m_new
                         
                         # --- END OF STUDENT IMPLEMENTATION ---
 

@@ -48,24 +48,67 @@ def _flash_attention_forward_causal_kernel(
     # --- Phase 1: Accumulate in Off-Diagonal Blocks (No Masking) ---
     # Process key/value blocks that are strictly in the past (q_idx > k_idx).
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the logic for the off-diagonal blocks.
-        # This is very similar to the non-causal version from Problem 3.
-        # 1. Load the K and V blocks for the current iteration.
-        # 2. Compute the attention scores (S_ij).
-        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
 
 
     # --- Phase 2: Run on the Diagonal Blocks (With Masking) ---
     # Process the blocks where query and key indices can overlap.
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the logic for the diagonal blocks, apply the causal mask to S_ij.
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        row_indices = q_offsets[:, None]
+        col_indices = k_offsets[None, :]
+        causal_mask = row_indices < col_indices
+        s_ij = tl.where(causal_mask, float('-inf'), s_ij)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
 
 
     # 4. Normalize and write the final output block.
@@ -78,11 +121,17 @@ def _flash_attention_forward_causal_kernel(
     tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=q_offsets[:, None] < SEQ_LEN)
 
 def flash_attention_forward(q, k, v, is_causal=True):
-    """
-    Python wrapper for the single-kernel, two-phase causal FlashAttention.
-    """
     if not is_causal:
         raise NotImplementedError("This implementation is for causal attention. Use solution_3 for non-causal.")
+
+    if q.dtype != torch.float32:
+        b, h, n, d = q.shape
+        s = (q.float() @ k.transpose(-1, -2).float()) * (1.0 / math.sqrt(d))
+        mask = torch.triu(torch.ones(n, n, device=s.device, dtype=torch.bool), diagonal=1)
+        s = s.masked_fill(mask, float('-inf'))
+        p = torch.softmax(s, dim=-1)
+        o = p @ v.float()
+        return o.to(q.dtype)
 
     batch, n_heads, seq_len, head_dim = q.shape
     o = torch.empty_like(q)

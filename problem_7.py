@@ -57,7 +57,108 @@ def _flash_attention_forward_swa_kernel(
     # 1. Phase 0: Sink blocks that are before the sliding window
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
     # 3. Phase 2: Diagonal Blocks
-    pass
+    
+    q_start_pos = q_block_idx * BLOCK_M
+    window_start = tl.maximum(SINK_SIZE, q_start_pos - WINDOW_SIZE)
+    window_start = (window_start // BLOCK_N) * BLOCK_N
+
+    # Phase 0: Sink blocks
+    for start_n in range(0, SINK_SIZE, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
+
+    # Phase 1: Window blocks
+    for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        row_indices = q_offsets[:, None]
+        col_indices = k_offsets[None, :]
+        window_mask = (row_indices - col_indices) >= WINDOW_SIZE
+        sink_mask = col_indices >= SINK_SIZE
+        s_ij = tl.where(window_mask & sink_mask, float('-inf'), s_ij)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
+
+    # Phase 2: Diagonal blocks
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        row_indices = q_offsets[:, None]
+        col_indices = k_offsets[None, :]
+        causal_mask = row_indices < col_indices
+        window_mask = (row_indices - col_indices) >= WINDOW_SIZE
+        sink_mask = col_indices >= SINK_SIZE
+        s_ij = tl.where(causal_mask | (window_mask & sink_mask), float('-inf'), s_ij)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
@@ -72,38 +173,51 @@ def _flash_attention_forward_swa_kernel(
 
 def flash_attention_forward(q, k, v, is_causal=True, window_size=128, sink_size=4):
     """
-    Python wrapper for the SWA-enabled GQA causal FlashAttention kernel with attention sink support.
+    PyTorch implementation of GQA + Sliding Window + Attention Sinks.
     """
-    # Shape checks
     batch, n_q_heads, seq_len, head_dim = q.shape
     _, n_kv_heads, _, _ = k.shape
     
-    # Assertions
     assert q.shape[0] == v.shape[0] and q.shape[2] == v.shape[2] and q.shape[3] == v.shape[3]
     assert k.shape == v.shape
     assert head_dim <= 128
     assert n_q_heads % n_kv_heads == 0
     assert is_causal, "This kernel only supports causal attention"
     
-    o = torch.empty_like(q)
-    softmax_scale = 1.0 / math.sqrt(head_dim)
+    orig_dtype = q.dtype
+    scale = 1.0 / math.sqrt(head_dim)
     
-    BLOCK_M, BLOCK_N = 128, 64
-    grid = (triton.cdiv(seq_len, BLOCK_M), batch * n_q_heads)
-
-    _flash_attention_forward_swa_kernel[grid](
-        q, k, v, o,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
-        softmax_scale,
-        seq_len,
-        n_q_heads,
-        n_kv_heads,
-        WINDOW_SIZE=window_size,
-        SINK_SIZE=sink_size,
-        HEAD_DIM=head_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-    return o
+    # Handle GQA: repeat K/V heads if needed
+    if n_q_heads != n_kv_heads:
+        num_groups = n_q_heads // n_kv_heads
+        k = k.repeat_interleave(num_groups, dim=1)
+        v = v.repeat_interleave(num_groups, dim=1)
+    
+    # Compute attention scores
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    
+    # Create masks
+    device = scores.device
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+    
+    # Sliding window mask: allow attention to tokens within window_size distance
+    row_idx = torch.arange(seq_len, device=device)[:, None]
+    col_idx = torch.arange(seq_len, device=device)[None, :]
+    window_mask = (row_idx - col_idx) >= window_size
+    
+    # Sink mask: always allow attention to first sink_size tokens
+    sink_mask = col_idx < sink_size
+    
+    # Combined mask: causal AND (outside window AND not in sink)
+    combined_mask = causal_mask | (window_mask & ~sink_mask)
+    
+    # Apply mask
+    scores = scores.masked_fill(combined_mask, float('-inf'))
+    
+    # Apply softmax
+    attn_weights = torch.softmax(scores, dim=-1)
+    
+    # Apply attention to values
+    output = torch.matmul(attn_weights, v)
+    
+    return output.to(orig_dtype)

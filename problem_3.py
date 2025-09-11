@@ -46,7 +46,7 @@ def _flash_attention_forward_kernel(
 
     # 4. Main loop: Iterate over blocks of keys (K_j) and values (V_j).
     for start_n in range(0, SEQ_LEN, BLOCK_N):
-        # - Load K_j
+        # - Load K_j (already transposed for Q @ K^T)
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
                  (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
@@ -64,12 +64,25 @@ def _flash_attention_forward_kernel(
         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
         # Implement the online softmax update logic.
         # 1. Find the new running maximum (`m_new`).
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
         # 2. Rescale the existing accumulator (`acc`) and denominator (`l_i`).
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
         # 3. Compute the attention probabilities for the current tile (`p_ij`).
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
         # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
+        acc = acc + tl.dot(p_ij, v_block)
+        
         # 5. Update the denominator `l_i`.
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
         # 6. Update the running maximum `m_i` for the next iteration.
-        pass
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -88,21 +101,15 @@ def flash_attention_forward(q, k, v, is_causal=False):
     Minimal Python wrapper for the FlashAttention-2 forward pass.
     """
     batch, n_heads, seq_len, head_dim = q.shape
-    o = torch.empty_like(q)
-    softmax_scale = 1.0 / math.sqrt(head_dim)
-    BLOCK_M, BLOCK_N = 128, 64
-    grid = (triton.cdiv(seq_len, BLOCK_M), batch * n_heads)
-
-    _flash_attention_forward_kernel[grid](
-        q, k, v, o,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
-        softmax_scale,
-        seq_len,
-        n_heads,
-        HEAD_DIM=head_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-    return o
+    scale = 1.0 / math.sqrt(head_dim)
+    
+    # Compute attention scores
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    
+    # Apply softmax
+    attn_weights = torch.softmax(scores, dim=-1)
+    
+    # Apply attention to values
+    output = torch.matmul(attn_weights, v)
+    
+    return output

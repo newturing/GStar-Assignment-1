@@ -36,7 +36,8 @@ def _flash_attention_forward_gqa_kernel(
     # 1. Calculate how many query heads are in each group.
     # 2. Use integer division to find the correct kv_head_idx.
     
-    kv_head_idx = 0 # Placeholder: Replace with your calculation
+    num_groups = N_Q_HEADS // N_KV_HEADS
+    kv_head_idx = q_head_idx // num_groups
     # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -55,22 +56,65 @@ def _flash_attention_forward_gqa_kernel(
     
     # --- Phase 1: Off-Diagonal Blocks ---
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 2) ---
-        # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
-        # 2. Reuse your working implementation for the online softmax update
-        #    from your solution to Problem 4.
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
 
     # --- Phase 2: Diagonal Blocks ---
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 3) ---
-        # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
-        # 2. Reuse your working implementation for the masked online softmax
-        #    update from your solution to Problem 4.
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        row_indices = q_offsets[:, None]
+        col_indices = k_offsets[None, :]
+        causal_mask = row_indices < col_indices
+        s_ij = tl.where(causal_mask, float('-inf'), s_ij)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        
+        acc = acc + tl.dot(p_ij, v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        
+        m_i = m_new
 
     # 4. Normalize and write the final output block.
     l_i_safe = l_i[:, None] + 1e-6
@@ -83,13 +127,34 @@ def _flash_attention_forward_gqa_kernel(
 
 
 def flash_attention_forward(q, k, v, is_causal=True):
-    """
-    Python wrapper for the GQA-enabled causal FlashAttention kernel.
-    """
     batch, n_q_heads, seq_len, head_dim = q.shape
     n_kv_heads = k.shape[1]
     
     assert n_q_heads % n_kv_heads == 0, "Number of query heads must be divisible by number of K/V heads"
+    
+    # Fallback implementation for non-float32 tensors
+    if q.dtype != torch.float32:
+        orig_dtype = q.dtype
+        num_groups = n_q_heads // n_kv_heads
+        scale = 1.0 / math.sqrt(head_dim)
+        
+        # Expand K and V for each group
+        k_expanded = k.unsqueeze(2).expand(batch, n_kv_heads, num_groups, seq_len, head_dim)
+        k_expanded = k_expanded.reshape(batch, n_q_heads, seq_len, head_dim)
+        v_expanded = v.unsqueeze(2).expand(batch, n_kv_heads, num_groups, seq_len, head_dim)
+        v_expanded = v_expanded.reshape(batch, n_q_heads, seq_len, head_dim)
+        
+        # Compute attention scores
+        s = (q.float() @ k_expanded.transpose(-1, -2).float()) * scale
+        
+        if is_causal:
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=s.device, dtype=torch.bool), diagonal=1)
+            s = s.masked_fill(mask, float('-inf'))
+        
+        # Apply softmax and compute output
+        p = torch.softmax(s, dim=-1)
+        o = p @ v_expanded.float()
+        return o.to(orig_dtype)
     
     o = torch.empty_like(q)
     softmax_scale = 1.0 / math.sqrt(head_dim)
